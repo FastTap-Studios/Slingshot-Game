@@ -27,15 +27,36 @@ const P1_CONTROLS = { left: 'ArrowLeft', right: 'ArrowRight', fire: ' ' };
 const P2_CONTROLS = { left: 'd', right: 'a', fire: 'w' };
 
 const SOCKET_PORT = 3000;
+const PROD_SOCKET_URL = 'https://gemini-slingshot-socket.onrender.com';
+const SOCKET_CONNECT_ERROR_DELAY_MS = 18000;
+
 /** Socket URL: VITE_SOCKET_URL i prod (Cloudflare). Lokalt: samma host på port 3000. */
-function getSocketUrl(): string | undefined {
-  if (typeof window === 'undefined') return undefined;
+function getSocketUrl(): string {
+  if (typeof window === 'undefined') return PROD_SOCKET_URL;
   const envUrl = typeof import.meta.env?.VITE_SOCKET_URL === 'string' ? import.meta.env.VITE_SOCKET_URL.trim() : '';
   if (envUrl) return envUrl;
   if (import.meta.env.DEV) {
     return `http://${window.location.hostname}:${SOCKET_PORT}`;
   }
-  return undefined;
+  return PROD_SOCKET_URL;
+}
+
+function getSocketErrorMessage(): string {
+  if (import.meta.env.DEV) {
+    return 'Could not connect. Run "npm run server" in a terminal and set VITE_SOCKET_URL=http://localhost:3000 in .env.';
+  }
+  return 'Could not reach the game server. It may be waking up — wait about 30 seconds and try Quick Match again.';
+}
+
+function createOnlineSocket(): Socket {
+  return io(getSocketUrl(), {
+    withCredentials: false,
+    reconnection: true,
+    reconnectionAttempts: 20,
+    reconnectionDelay: 1500,
+    reconnectionDelayMax: 8000,
+    timeout: 20000,
+  });
 }
 
 const PINCH_THRESHOLD = 0.05;
@@ -227,6 +248,7 @@ const GeminiSlingshot: React.FC = () => {
   const [isMatchmaking, setIsMatchmaking] = useState<boolean>(false);
   const [copied, setCopied] = useState<boolean>(false);
   const [socketError, setSocketError] = useState<string | null>(null);
+  const [isConnectingServer, setIsConnectingServer] = useState(false);
   const [opponentScore, setOpponentScore] = useState<number | null>(null);
   const opponentStateRef = useRef<BoardSnapshot | null>(null);
   const [opponentAttack, setOpponentAttack] = useState<AttackEvent | undefined>();
@@ -238,6 +260,7 @@ const GeminiSlingshot: React.FC = () => {
   const [showHowToPlay, setShowHowToPlay] = useState(false);
   const [showSplash, setShowSplash] = useState(true);
   const pendingOnlineActionRef = useRef<'find-match' | { type: 'join-room'; roomId: string } | null>(null);
+  const socketConnectErrorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const socketRef = useRef<Socket | null>(null);
   const roomIdRef = useRef<string>('');
   const myOnlineBoardRef = useRef<GameBoardHandle>(null);
@@ -276,12 +299,27 @@ const GeminiSlingshot: React.FC = () => {
 
   useEffect(() => {
     if (mode !== 'online-setup' && mode !== 'online-game') return;
+    const clearConnectErrorTimer = () => {
+      if (socketConnectErrorTimerRef.current) {
+        clearTimeout(socketConnectErrorTimerRef.current);
+        socketConnectErrorTimerRef.current = null;
+      }
+    };
+    const scheduleConnectError = (s: Socket) => {
+      clearConnectErrorTimer();
+      socketConnectErrorTimerRef.current = setTimeout(() => {
+        if (!s.connected) setSocketError(getSocketErrorMessage());
+      }, SOCKET_CONNECT_ERROR_DELAY_MS);
+    };
     const s = socket ?? (() => {
-      const url = getSocketUrl();
-      const n = url ? io(url, { withCredentials: false, transports: ['websocket'] }) : io({ transports: ['websocket'] });
+      const n = createOnlineSocket();
       setSocket(n);
       return n;
     })();
+    if (!s.connected) {
+      setIsConnectingServer(true);
+      scheduleConnectError(s);
+    }
     s.on('player-assignment', (id: number) => setMyPlayerId(id));
     s.on('game-start', (data?: { roomId: string }) => {
       if (data?.roomId) setRoomId(data.roomId);
@@ -308,8 +346,16 @@ const GeminiSlingshot: React.FC = () => {
       setOpponentLeft(true);
       setOpponentGameOver(true);
     });
-    s.on('connect', () => setSocketError(null));
-    s.on('connect_error', () => setSocketError('Could not connect. Run "npm run server" on the computer and open the game from this device using the computer\'s IP (e.g. http://192.168.x.x:5173).'));
+    s.on('connect', () => {
+      clearConnectErrorTimer();
+      setSocketError(null);
+      setIsConnectingServer(false);
+    });
+    s.on('connect_error', () => {
+      setIsConnectingServer(true);
+      setSocketError(null);
+      scheduleConnectError(s);
+    });
     const sendPending = () => {
       const pending = pendingOnlineActionRef.current;
       if (!pending) return;
@@ -320,6 +366,7 @@ const GeminiSlingshot: React.FC = () => {
     if (s.connected) sendPending();
     else s.once('connect', sendPending);
     return () => {
+      clearConnectErrorTimer();
       s.off('player-assignment')
         .off('game-start')
         .off('waiting-for-match')
@@ -1702,6 +1749,13 @@ const GeminiSlingshot: React.FC = () => {
               <div className="w-2 h-2 bg-purple-500 rounded-full animate-bounce" />
             </div>
           )}
+          {isConnectingServer && !socketError && !socket?.connected && (
+            <p className="text-amber-400 text-sm mb-4">
+              {import.meta.env.DEV
+                ? 'Connecting to server...'
+                : 'Connecting to server — the first match after inactivity can take up to 30 seconds.'}
+            </p>
+          )}
           {socketError && (
             <p className="text-red-400 text-sm mb-4">{socketError}</p>
           )}
@@ -1710,6 +1764,7 @@ const GeminiSlingshot: React.FC = () => {
               socket?.disconnect();
               setMode('menu');
               setIsMatchmaking(false);
+              setIsConnectingServer(false);
               setSocketError(null);
             }}
             className="text-slate-500 hover:text-white transition-all text-sm font-bold uppercase tracking-widest"
@@ -2524,8 +2579,7 @@ const GeminiSlingshot: React.FC = () => {
               <button
                 onClick={() => {
                   setSocketError(null);
-                  const url = getSocketUrl();
-                  const s = url ? io(url, { withCredentials: false, transports: ['websocket'] }) : io({ transports: ['websocket'] });
+                  const s = createOnlineSocket();
                   setSocket(s);
                   pendingOnlineActionRef.current = 'find-match';
                   setMode('online-setup');
@@ -2555,8 +2609,7 @@ const GeminiSlingshot: React.FC = () => {
                     setSocketError(null);
                     const idToJoin = roomId || Math.random().toString(36).substring(2, 7).toUpperCase();
                     setRoomId(idToJoin);
-                    const url = getSocketUrl();
-                    const s = url ? io(url, { withCredentials: false, transports: ['websocket'] }) : io({ transports: ['websocket'] });
+                    const s = createOnlineSocket();
                     setSocket(s);
                     pendingOnlineActionRef.current = { type: 'join-room', roomId: idToJoin };
                     setMode('online-setup');
