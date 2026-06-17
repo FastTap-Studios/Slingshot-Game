@@ -20,7 +20,6 @@ const TOUCH_ANGLE_SENSITIVITY = 0.008;
 
 const NEW_ROW_INTERVAL_MS = 15 * 1000; // Local PvP/online: 15 s per new row
 const DESKTOP_WALL_REF_WIDTH = 528;
-const WALL_MARKER_WIDTH_REF = 6;
 /** Single Player-layout (GeminiSlingshot): scale från bredd 528, samma som Single Player-banan */
 const SINGLE_REF_WIDTH = 528;
 const SINGLE_REF_BUBBLE_RADIUS = 22;
@@ -118,8 +117,50 @@ interface GameBoardProps {
   useSinglePlayerLayout?: boolean;
   /** Online PvP: motståndarens bräde (ritas istället för egen state) */
   remoteState?: BoardSnapshot | null;
+  /** Online PvP: ref-variant – uppdateras utan React re-render (bättre prestanda) */
+  remoteStateRef?: React.MutableRefObject<BoardSnapshot | null>;
+  /** Online PvP: skicka snapshot efter render (throttlad) */
+  onSyncSnapshot?: (state: BoardSnapshot) => void;
+  /** Online PvP: motståndarspegel – hoppar över tunga dekorationer */
+  isRemoteMirror?: boolean;
   /** Invertera touch-styrning (används för lokal PvP spelare 2) */
   invertTouch?: boolean;
+}
+
+const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+
+function blendRemoteSnapshot(blend: {
+  prev: BoardSnapshot | null;
+  next: BoardSnapshot | null;
+  startedAt: number;
+}, now: number): BoardSnapshot | null {
+  const next = blend.next;
+  if (!next) return null;
+  const prev = blend.prev;
+  if (!prev || prev === next) return next;
+  const duration = next.isFlying ? 60 : 110;
+  let t = Math.min(1, (now - blend.startedAt) / duration);
+  t = t * t * (3 - 2 * t);
+  let ballX = lerp(prev.ballPos.x, next.ballPos.x, t);
+  let ballY = lerp(prev.ballPos.y, next.ballPos.y, t);
+  if (next.isFlying && next.ballVel) {
+    const extra = Math.max(0, (now - blend.startedAt - duration) / 1000);
+    const cap = Math.min(extra, 0.12);
+    ballX += next.ballVel.x * cap;
+    ballY += next.ballVel.y * cap;
+  }
+  const prevBubbles = new Map(prev.bubbles.map((b) => [b.id, b]));
+  const bubbles = next.bubbles.map((b) => {
+    const p = prevBubbles.get(b.id);
+    if (!p) return b;
+    return { ...b, x: lerp(p.x, b.x, t), y: lerp(p.y, b.y, t) };
+  });
+  return {
+    ...next,
+    ballPos: { x: ballX, y: ballY },
+    angle: lerp(prev.angle, next.angle, t),
+    bubbles,
+  };
 }
 
 export interface GameBoardHandle {
@@ -128,7 +169,20 @@ export interface GameBoardHandle {
   getSnapshot: () => BoardSnapshot | null;
 }
 
-const GameBoard = forwardRef<GameBoardHandle, GameBoardProps>(({ playerId, playerName, controls, onCombo, onGameOver, incomingAttack, isMultiplayer, hideOwnGameOver, isFrozen, level, onLevelWin, useSinglePlayerLayout, remoteState, invertTouch }, ref) => {
+const GameBoard = forwardRef<GameBoardHandle, GameBoardProps>(({ playerId, playerName, controls, onCombo, onGameOver, incomingAttack, isMultiplayer, hideOwnGameOver, isFrozen, level, onLevelWin, useSinglePlayerLayout, remoteState, remoteStateRef: remoteStateRefProp, onSyncSnapshot, isRemoteMirror, invertTouch }, ref) => {
+  const remoteViewRef = useRef<BoardSnapshot | null>(remoteState ?? null);
+  const remoteBlendRef = useRef<{ prev: BoardSnapshot | null; next: BoardSnapshot | null; startedAt: number; lastRef: BoardSnapshot | null }>({
+    prev: null,
+    next: null,
+    startedAt: 0,
+    lastRef: null,
+  });
+  const lastSyncSentRef = useRef(0);
+  const lastSyncSigRef = useRef('');
+  useEffect(() => {
+    if (remoteStateRefProp) return;
+    remoteViewRef.current = remoteState ?? null;
+  }, [remoteState, remoteStateRefProp]);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const gameContainerRef = useRef<HTMLDivElement>(null);
   const [showIntro, setShowIntro] = useState(!!level);
@@ -715,7 +769,30 @@ const GameBoard = forwardRef<GameBoardHandle, GameBoardProps>(({ playerId, playe
     ballVel.current = { x: dx * velocityMultiplier, y: dy * velocityMultiplier };
     flyingBallColorRef.current = selectedColorRef.current;
     flyingBallIsFireRef.current = currentBallIsFireRef.current;
-  }, [isGameOver, isFrozen, level?.isTutorial]);
+    if (onSyncSnapshot) {
+      const layout = layoutRef.current;
+      if (layout.width > 0) {
+        lastSyncSigRef.current = '';
+        lastSyncSentRef.current = 0;
+        onSyncSnapshot({
+          width: layout.width,
+          height: layout.height,
+          bubbles: bubbles.current
+            .filter((b) => b.active)
+            .map((b) => ({ id: b.id, x: b.x, y: b.y, color: b.color, type: b.type, active: true })),
+          ballPos: { x: ballPos.current.x, y: ballPos.current.y },
+          angle: angleRef.current,
+          score: scoreRef.current,
+          ballColor: selectedColorRef.current,
+          isFlying: true,
+          ballVel: { ...ballVel.current },
+          flyingBallColor: flyingBallColorRef.current ?? undefined,
+          flyingBallIsFire: flyingBallIsFireRef.current,
+        });
+        lastSyncSentRef.current = performance.now();
+      }
+    }
+  }, [isGameOver, isFrozen, level?.isTutorial, onSyncSnapshot]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -933,7 +1010,7 @@ const GameBoard = forwardRef<GameBoardHandle, GameBoardProps>(({ playerId, playe
     if (!canvasRef.current || !gameContainerRef.current) return;
     const canvas = canvasRef.current;
     const container = gameContainerRef.current;
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
     let animationFrameId: number;
@@ -941,7 +1018,18 @@ const GameBoard = forwardRef<GameBoardHandle, GameBoardProps>(({ playerId, playe
     const render = (currentTime: number) => {
       const deltaTime = currentTime - lastTime;
       lastTime = currentTime;
-      const isRemoteView = Boolean(remoteState);
+      const rawRemote = remoteStateRefProp?.current ?? remoteViewRef.current;
+      const isRemoteView = Boolean(rawRemote);
+      let remoteSnap: BoardSnapshot | null = null;
+      if (isRemoteView && rawRemote) {
+        if (rawRemote !== remoteBlendRef.current.lastRef) {
+          remoteBlendRef.current.prev = remoteBlendRef.current.next ?? rawRemote;
+          remoteBlendRef.current.next = rawRemote;
+          remoteBlendRef.current.startedAt = currentTime;
+          remoteBlendRef.current.lastRef = rawRemote;
+        }
+        remoteSnap = blendRemoteSnapshot(remoteBlendRef.current, currentTime);
+      }
       if (!isRemoteView && !isFlying.current) {
         const rotationSpeed = 0.003;
         if (keysPressed.current.has(controls.left)) angleRef.current -= rotationSpeed * deltaTime;
@@ -985,11 +1073,80 @@ const GameBoard = forwardRef<GameBoardHandle, GameBoardProps>(({ playerId, playe
         powerRef.current = layoutRef.current.constantPower;
         anchorPos.current = { x: cw / 2, y: ch - layoutRef.current.slingshotOffset };
         if (!isFlying.current) ballPos.current = { ...anchorPos.current };
-        if (!remoteState && bubbles.current.length === 0 && cw > 0 && ch > 0) {
+        if (!remoteSnap && bubbles.current.length === 0 && cw > 0 && ch > 0) {
           initGrid(cw);
         }
       }
       const { bubbleRadius, rowHeight, gridCols } = layoutRef.current;
+
+      if (isRemoteMirror) {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#0d0d0d';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        const mirrorGridWidth = gridCols * bubbleRadius * 2;
+        const mirrorXOffset = (canvas.width - mirrorGridWidth) / 2 + bubbleRadius;
+        const mirrorGridLeft = mirrorXOffset - bubbleRadius;
+        const mirrorGridRight = mirrorXOffset + mirrorGridWidth - bubbleRadius;
+        const mirrorDesktop = canvas.width >= DESKTOP_WALL_REF_WIDTH;
+        if (mirrorDesktop) {
+          ctx.fillStyle = 'rgba(66, 165, 245, 0.85)';
+          ctx.fillRect(mirrorGridLeft, 0, 2, canvas.height);
+          ctx.fillRect(mirrorGridRight - 2, 0, 2, canvas.height);
+        } else {
+          ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
+          ctx.lineWidth = 4;
+          ctx.beginPath();
+          ctx.moveTo(2, 0);
+          ctx.lineTo(2, canvas.height);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(canvas.width - 2, 0);
+          ctx.lineTo(canvas.width - 2, canvas.height);
+          ctx.stroke();
+        }
+        if (remoteSnap && remoteSnap.width > 0 && remoteSnap.height > 0) {
+          const sx = canvas.width / remoteSnap.width;
+          const sy = canvas.height / remoteSnap.height;
+          remoteSnap.bubbles.forEach((b) => {
+            if (!b.active) return;
+            drawBubble(ctx, b.x * sx, b.y * sy, bubbleRadius - 1, b.color, b.type);
+          });
+          const launcherX = canvas.width / 2;
+          const launcherY = canvas.height - layoutRef.current.slingshotOffset;
+          const slingScale = 0.82;
+          const band = 40 * slingScale;
+          const bandY = 10 * slingScale;
+          const isFlyingRemote = Boolean(remoteSnap.isFlying);
+          const restBallOffset = 30 * slingScale;
+          const ballX = remoteSnap.ballPos.x * sx;
+          const ballDrawY = isFlyingRemote ? remoteSnap.ballPos.y * sy : remoteSnap.ballPos.y * sy - restBallOffset;
+          const ballColor = isFlyingRemote && remoteSnap.flyingBallColor
+            ? remoteSnap.flyingBallColor
+            : (remoteSnap.ballColor ?? 'red');
+          if (!isFlyingRemote) {
+            ctx.strokeStyle = 'rgba(66, 165, 245, 0.5)';
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.moveTo(launcherX - band, launcherY - bandY);
+            ctx.lineTo(ballX, ballDrawY);
+            ctx.moveTo(launcherX + band, launcherY - bandY);
+            ctx.lineTo(ballX, ballDrawY);
+            ctx.stroke();
+          }
+          const drawR = isFlyingRemote ? bubbleRadius : bubbleRadius * slingScale;
+          drawBubble(
+            ctx,
+            ballX,
+            ballDrawY,
+            drawR,
+            ballColor,
+            isFlyingRemote ? (remoteSnap.flyingBallIsFire ? 'fire' : undefined) : undefined
+          );
+        }
+        animationFrameId = requestAnimationFrame(render);
+        return;
+      }
+
       // Game over: trigger as soon as any bubble touches the danger zone (every frame, same as single player)
       if (!isRemoteView && !isGameOverRef.current && anchorPos.current) {
         const slingshotLineY = anchorPos.current.y;
@@ -1027,20 +1184,14 @@ const GameBoard = forwardRef<GameBoardHandle, GameBoardProps>(({ playerId, playe
       const xOffset = (canvas.width - gridWidth) / 2 + bubbleRadius;
       const gridLeft = xOffset - bubbleRadius;
       const gridRight = xOffset + gridWidth - bubbleRadius;
+      const leftWall = gridLeft + bubbleRadius;
+      const rightWall = gridRight - bubbleRadius;
 
       if (isDesktopView) {
-        const wallW = WALL_MARKER_WIDTH_REF * (canvas.width / DESKTOP_WALL_REF_WIDTH);
-        const wallInner = 'rgba(66, 165, 245, 0.5)';
-        const wallOuter = 'rgba(66, 165, 245, 0.85)';
-        ctx.fillStyle = wallInner;
-        ctx.fillRect(gridLeft, 0, wallW, canvas.height);
-        ctx.fillRect(gridRight - wallW, 0, wallW, canvas.height);
-        ctx.fillStyle = wallOuter;
+        ctx.fillStyle = 'rgba(66, 165, 245, 0.85)';
         ctx.fillRect(gridLeft, 0, 2, canvas.height);
         ctx.fillRect(gridRight - 2, 0, 2, canvas.height);
       }
-      const leftWall = gridLeft + bubbleRadius;
-      const rightWall = gridRight - bubbleRadius;
       const dangerY = anchorPos.current.y - rowHeight;
       ctx.save();
       if (useSinglePlayerLayout) {
@@ -1087,10 +1238,11 @@ const GameBoard = forwardRef<GameBoardHandle, GameBoardProps>(({ playerId, playe
         ctx.lineTo(canvas.width - 2, canvas.height);
         ctx.stroke();
       }
-      if (remoteState && remoteState.width > 0 && remoteState.height > 0) {
-        const sx = canvas.width / remoteState.width;
-        const sy = canvas.height / remoteState.height;
-        remoteState.bubbles.forEach((b) => {
+      if (!isRemoteMirror && remoteSnap && remoteSnap.width > 0 && remoteSnap.height > 0) {
+        const sx = canvas.width / remoteSnap.width;
+        const sy = canvas.height / remoteSnap.height;
+        remoteSnap.bubbles.forEach((b) => {
+          if (!b.active) return;
           drawBubble(ctx, b.x * sx, b.y * sy, bubbleRadius - 1, b.color, b.type);
         });
         const launcherX = anchorPos.current.x;
@@ -1141,24 +1293,38 @@ const GameBoard = forwardRef<GameBoardHandle, GameBoardProps>(({ playerId, playe
         ctx.arc(launcherX + band, launcherY - bandY, 4 * slingScale, 0, Math.PI * 2);
         ctx.fill();
         ctx.restore();
+        const isFlyingRemote = Boolean(remoteSnap.isFlying);
         const restBallOffset = 30 * slingScale;
-        const ballX = remoteState.ballPos.x * sx;
-        const ballY = remoteState.ballPos.y * sy - restBallOffset;
-        const ballColor = remoteState.ballColor ?? 'red';
-        ctx.save();
-        ctx.beginPath();
-        ctx.moveTo(launcherX - band, launcherY - bandY);
-        ctx.lineTo(ballX, ballY);
-        ctx.moveTo(launcherX + band, launcherY - bandY);
-        ctx.lineTo(ballX, ballY);
-        ctx.lineWidth = 4;
-        ctx.strokeStyle = '#42a5f5';
-        ctx.shadowBlur = 15;
-        ctx.shadowColor = '#42a5f5';
-        ctx.globalAlpha = 0.6 + Math.sin(performance.now() * 0.001) * 0.2;
-        ctx.stroke();
-        ctx.restore();
-        drawBubble(ctx, ballX, ballY, bubbleRadius * slingScale, ballColor);
+        const ballX = remoteSnap.ballPos.x * sx;
+        const ballDrawY = isFlyingRemote ? remoteSnap.ballPos.y * sy : remoteSnap.ballPos.y * sy - restBallOffset;
+        const ballColor = isFlyingRemote && remoteSnap.flyingBallColor
+          ? remoteSnap.flyingBallColor
+          : (remoteSnap.ballColor ?? 'red');
+        const launcherBallR = bubbleRadius * slingScale;
+        if (!isFlyingRemote) {
+          ctx.save();
+          ctx.beginPath();
+          ctx.moveTo(launcherX - band, launcherY - bandY);
+          ctx.lineTo(ballX, ballDrawY);
+          ctx.moveTo(launcherX + band, launcherY - bandY);
+          ctx.lineTo(ballX, ballDrawY);
+          ctx.lineWidth = 4;
+          ctx.strokeStyle = '#42a5f5';
+          ctx.shadowBlur = 15;
+          ctx.shadowColor = '#42a5f5';
+          ctx.globalAlpha = 0.6 + Math.sin(performance.now() * 0.001) * 0.2;
+          ctx.stroke();
+          ctx.restore();
+        }
+        const drawR = isFlyingRemote ? bubbleRadius : launcherBallR;
+        drawBubble(
+          ctx,
+          ballX,
+          ballDrawY,
+          drawR,
+          ballColor,
+          isFlyingRemote ? (remoteSnap.flyingBallIsFire ? 'fire' : undefined) : (remoteSnap.ballColor === 'bomb' ? 'bomb' : undefined)
+        );
         ctx.restore();
         animationFrameId = requestAnimationFrame(render);
         return;
@@ -1406,9 +1572,9 @@ const GameBoard = forwardRef<GameBoardHandle, GameBoardProps>(({ playerId, playe
         let curY = launcherY;
         let dirX = Math.cos(fireAngle);
         let dirY = Math.sin(fireAngle);
-        const maxDistance = 1200;
+        const maxDistance = isMultiplayer ? 800 : 1200;
         let distanceTravelled = 0;
-        const stepSize = 5;
+        const stepSize = isMultiplayer ? 12 : 5;
         ctx.beginPath();
         ctx.moveTo(curX, curY);
         const totalDash = 30;
@@ -1542,11 +1708,46 @@ const GameBoard = forwardRef<GameBoardHandle, GameBoardProps>(({ playerId, playe
       }
       processIncomingBubbles(canvas.width, canvas.height);
       ctx.restore();
+      if (!isRemoteView && onSyncSnapshot) {
+        const syncInterval = isFlying.current ? 40 : 100;
+        if (currentTime - lastSyncSentRef.current >= syncInterval) {
+          const layout = layoutRef.current;
+          if (layout.width > 0 && layout.height > 0) {
+            const sig = `${isFlying.current ? 1 : 0}|${Math.round(ballPos.current.x)}|${Math.round(ballPos.current.y)}|${Math.round(ballVel.current.x)}|${Math.round(ballVel.current.y)}|${bubbles.current.filter((b) => b.active).length}|${scoreRef.current}`;
+            if (sig !== lastSyncSigRef.current || isFlying.current) {
+              lastSyncSigRef.current = sig;
+              lastSyncSentRef.current = currentTime;
+              onSyncSnapshot({
+                width: layout.width,
+                height: layout.height,
+                bubbles: bubbles.current
+                  .filter((b) => b.active)
+                  .map((b) => ({
+                    id: b.id,
+                    x: b.x,
+                    y: b.y,
+                    color: b.color,
+                    type: b.type,
+                    active: true,
+                  })),
+                ballPos: { x: ballPos.current.x, y: ballPos.current.y },
+                angle: angleRef.current,
+                score: scoreRef.current,
+                ballColor: selectedColorRef.current,
+                isFlying: isFlying.current,
+                ballVel: isFlying.current ? { ...ballVel.current } : undefined,
+                flyingBallColor: isFlying.current ? flyingBallColorRef.current ?? undefined : undefined,
+                flyingBallIsFire: isFlying.current ? flyingBallIsFireRef.current : undefined,
+              });
+            }
+          }
+        }
+      }
       animationFrameId = requestAnimationFrame(render);
     };
     animationFrameId = requestAnimationFrame(render);
     return () => cancelAnimationFrame(animationFrameId);
-  }, [controls, isGameOver, processIncomingBubbles, isMultiplayer, useSinglePlayerLayout, getBubblePos, checkMatches, updateAvailableColors, pickQueueBall, level, onGameOver, remoteState]);
+  }, [controls, isGameOver, processIncomingBubbles, isMultiplayer, useSinglePlayerLayout, getBubblePos, checkMatches, updateAvailableColors, pickQueueBall, level, onGameOver, remoteStateRefProp, onSyncSnapshot, isRemoteMirror]);
 
   const resetGame = useCallback(() => {
     if (!canvasRef.current) return;
@@ -1568,6 +1769,9 @@ const GameBoard = forwardRef<GameBoardHandle, GameBoardProps>(({ playerId, playe
     lastAttackIdRef.current = -1;
     nextBubbleIdRef.current = 0;
     gameOverReasonRef.current = null;
+    lastSyncSigRef.current = '';
+    lastSyncSentRef.current = 0;
+    remoteBlendRef.current = { prev: null, next: null, startedAt: 0, lastRef: null };
     initGrid(canvasRef.current.width);
     ballPos.current = { ...anchorPos.current };
     ballVel.current = { x: 0, y: 0 };
@@ -1580,18 +1784,24 @@ const GameBoard = forwardRef<GameBoardHandle, GameBoardProps>(({ playerId, playe
     return {
       width: layout.width,
       height: layout.height,
-      bubbles: bubbles.current.map((b) => ({
-        id: b.id,
-        x: b.x,
-        y: b.y,
-        color: b.color,
-        type: b.type,
-        active: b.active,
-      })),
-      ballPos: { ...ballPos.current },
+      bubbles: bubbles.current
+        .filter((b) => b.active)
+        .map((b) => ({
+          id: b.id,
+          x: b.x,
+          y: b.y,
+          color: b.color,
+          type: b.type,
+          active: true,
+        })),
+      ballPos: { x: ballPos.current.x, y: ballPos.current.y },
       angle: angleRef.current,
       score: scoreRef.current,
       ballColor: selectedColorRef.current,
+      isFlying: isFlying.current,
+      ballVel: isFlying.current ? { ...ballVel.current } : undefined,
+      flyingBallColor: isFlying.current ? flyingBallColorRef.current ?? undefined : undefined,
+      flyingBallIsFire: isFlying.current ? flyingBallIsFireRef.current : undefined,
     };
   }, []);
 

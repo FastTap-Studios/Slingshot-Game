@@ -60,6 +60,10 @@ export interface BoardSnapshot {
   score: number;
   /** Color of the ball in the slingshot (for opponent view) */
   ballColor?: BubbleColor;
+  isFlying?: boolean;
+  ballVel?: Point;
+  flyingBallColor?: BubbleColor;
+  flyingBallIsFire?: boolean;
 }
 
 export interface StrategicHint {

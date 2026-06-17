@@ -227,7 +227,8 @@ const GeminiSlingshot: React.FC = () => {
   const [isMatchmaking, setIsMatchmaking] = useState<boolean>(false);
   const [copied, setCopied] = useState<boolean>(false);
   const [socketError, setSocketError] = useState<string | null>(null);
-  const [opponentState, setOpponentState] = useState<BoardSnapshot | null>(null);
+  const [opponentScore, setOpponentScore] = useState<number | null>(null);
+  const opponentStateRef = useRef<BoardSnapshot | null>(null);
   const [opponentAttack, setOpponentAttack] = useState<AttackEvent | undefined>();
   const [opponentGameOver, setOpponentGameOver] = useState<boolean>(false);
   const [opponentLeft, setOpponentLeft] = useState<boolean>(false);
@@ -277,7 +278,7 @@ const GeminiSlingshot: React.FC = () => {
     if (mode !== 'online-setup' && mode !== 'online-game') return;
     const s = socket ?? (() => {
       const url = getSocketUrl();
-      const n = url ? io(url, { withCredentials: false }) : io();
+      const n = url ? io(url, { withCredentials: false, transports: ['websocket'] }) : io({ transports: ['websocket'] });
       setSocket(n);
       return n;
     })();
@@ -286,7 +287,8 @@ const GeminiSlingshot: React.FC = () => {
       if (data?.roomId) setRoomId(data.roomId);
       setIsWaiting(false);
       setOpponentAttack(undefined);
-      setOpponentState(null);
+      opponentStateRef.current = null;
+      setOpponentScore(null);
       setOpponentGameOver(false);
       setOnlineSelfGameOver(false);
       setRematchRequested(false);
@@ -298,7 +300,10 @@ const GeminiSlingshot: React.FC = () => {
     s.on('opponent-game-over', (playerIdWhoLost: number) => {
       setOpponentGameOver(playerIdWhoLost !== myPlayerId);
     });
-    s.on('opponent-state', (state: BoardSnapshot) => setOpponentState(state));
+    s.on('opponent-state', (state: BoardSnapshot) => {
+      opponentStateRef.current = state;
+      setOpponentScore((prev) => (prev === state.score ? prev : state.score));
+    });
     s.on('opponent-left', () => {
       setOpponentLeft(true);
       setOpponentGameOver(true);
@@ -340,7 +345,8 @@ const GeminiSlingshot: React.FC = () => {
     const s = socket;
     const onRematchStart = () => {
       setOpponentAttack(undefined);
-      setOpponentState(null);
+      opponentStateRef.current = null;
+      setOpponentScore(null);
       setOpponentGameOver(false);
       setOnlineSelfGameOver(false);
       setRematchRequested(false);
@@ -362,8 +368,17 @@ const GeminiSlingshot: React.FC = () => {
       socket.disconnect();
       setSocket(null);
     }
-    setOpponentState(null);
+    opponentStateRef.current = null;
+    setOpponentScore(null);
   }, [mode, socket]);
+
+  const handleSyncSnapshot = useCallback(
+    (state: BoardSnapshot) => {
+      if (!socket || !roomId) return;
+      socket.volatile.emit('sync-state', { roomId, state });
+    },
+    [socket, roomId]
+  );
 
   const handleGameOver = useCallback(() => {
     if (!socket || !roomId) return;
@@ -381,15 +396,6 @@ const GeminiSlingshot: React.FC = () => {
     },
     [socket, roomId]
   );
-
-  useEffect(() => {
-    if (mode !== 'online-game' || !socket || !roomId) return;
-    const interval = setInterval(() => {
-      const state = myOnlineBoardRef.current?.getSnapshot?.();
-      if (state) socket.emit('sync-state', { roomId, state });
-    }, 80);
-    return () => clearInterval(interval);
-  }, [mode, socket, roomId]);
 
   const copyRoomId = () => {
     navigator.clipboard.writeText(roomId);
@@ -1740,7 +1746,8 @@ const GeminiSlingshot: React.FC = () => {
           <button
             onClick={() => {
               socket?.disconnect();
-              setOpponentState(null);
+              opponentStateRef.current = null;
+              setOpponentScore(null);
               setMode('menu');
             }}
             className="p-2 rounded-xl bg-white/5 hover:bg-white/10 text-slate-400 hover:text-white transition-all border border-white/5"
@@ -1748,13 +1755,14 @@ const GeminiSlingshot: React.FC = () => {
             EXIT
           </button>
         </div>
-        <div className="h-1/2 w-full relative rotate-180 overflow-hidden pointer-events-none">
-          {opponentState != null && (
+        <div className="h-1/2 w-full relative rotate-180 overflow-hidden pointer-events-none flex justify-center">
+          <div className="h-full w-full max-w-[528px] relative">
+          {opponentScore != null && (
             <div className="absolute top-2 left-2 z-50 rotate-180 text-xs font-bold text-emerald-400/90 bg-black/40 px-2 py-1 rounded">
-              Opponent score: {opponentState.score}
+              Opponent score: {opponentScore}
             </div>
           )}
-          {!opponentState && (
+          {opponentScore == null && (
             <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/20 backdrop-blur-[2px]">
               <p className="text-white/30 font-black text-4xl tracking-tighter rotate-180">OPPONENT</p>
             </div>
@@ -1766,11 +1774,14 @@ const GeminiSlingshot: React.FC = () => {
             onCombo={() => {}}
             incomingAttack={undefined}
             isMultiplayer={true}
-            remoteState={opponentState}
+            isRemoteMirror
+            remoteStateRef={opponentStateRef}
           />
+          </div>
         </div>
         <div className="h-px w-full bg-purple-500/30 z-50 relative shadow-[0_0_15px_rgba(168,85,247,0.4)]" />
-        <div className="h-1/2 w-full relative overflow-hidden">
+        <div className="h-1/2 w-full relative overflow-hidden flex justify-center">
+          <div className="h-full w-full max-w-[528px] relative">
           <GameBoard
             ref={myOnlineBoardRef}
             playerId={myPlayerId}
@@ -1783,7 +1794,9 @@ const GeminiSlingshot: React.FC = () => {
             invertTouch={false}
             hideOwnGameOver={onlineSelfGameOver}
             isFrozen={opponentGameOver || onlineSelfGameOver}
+            onSyncSnapshot={handleSyncSnapshot}
           />
+          </div>
         </div>
         {opponentGameOver && !onlineSelfGameOver && (
           <div className="absolute inset-0 z-[60] flex items-center justify-center bg-black/80 backdrop-blur-md p-4 sm:p-6">
@@ -1849,7 +1862,8 @@ const GeminiSlingshot: React.FC = () => {
                 <button
                   onClick={() => {
                     socket?.disconnect();
-                    setOpponentState(null);
+                    opponentStateRef.current = null;
+                    setOpponentScore(null);
                     setMode('menu');
                     setOpponentGameOver(false);
                     setOnlineSelfGameOver(false);
@@ -1912,7 +1926,8 @@ const GeminiSlingshot: React.FC = () => {
                 <button
                   onClick={() => {
                     socket?.disconnect();
-                    setOpponentState(null);
+                    opponentStateRef.current = null;
+                    setOpponentScore(null);
                     setMode('menu');
                     setOpponentGameOver(false);
                     setOnlineSelfGameOver(false);
@@ -2510,7 +2525,7 @@ const GeminiSlingshot: React.FC = () => {
                 onClick={() => {
                   setSocketError(null);
                   const url = getSocketUrl();
-                  const s = url ? io(url, { withCredentials: false }) : io();
+                  const s = url ? io(url, { withCredentials: false, transports: ['websocket'] }) : io({ transports: ['websocket'] });
                   setSocket(s);
                   pendingOnlineActionRef.current = 'find-match';
                   setMode('online-setup');
@@ -2541,7 +2556,7 @@ const GeminiSlingshot: React.FC = () => {
                     const idToJoin = roomId || Math.random().toString(36).substring(2, 7).toUpperCase();
                     setRoomId(idToJoin);
                     const url = getSocketUrl();
-                    const s = url ? io(url, { withCredentials: false }) : io();
+                    const s = url ? io(url, { withCredentials: false, transports: ['websocket'] }) : io({ transports: ['websocket'] });
                     setSocket(s);
                     pendingOnlineActionRef.current = { type: 'join-room', roomId: idToJoin };
                     setMode('online-setup');
