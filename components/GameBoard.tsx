@@ -20,6 +20,47 @@ const TOUCH_ANGLE_SENSITIVITY = 0.008;
 
 const NEW_ROW_INTERVAL_MS = 15 * 1000; // Local PvP/online: 15 s per new row
 const DESKTOP_WALL_REF_WIDTH = 528;
+
+function computeMultiplayerLayout(width: number, height: number, gridCols = GRID_COLS) {
+  const bubbleRadius = Math.min(width / (gridCols + 1) / 2, height / 32);
+  const gridWidth = gridCols * bubbleRadius * 2;
+  const xOffset = (width - gridWidth) / 2 + bubbleRadius;
+  const gridLeft = xOffset - bubbleRadius;
+  const gridRight = xOffset + gridWidth - bubbleRadius;
+  return {
+    bubbleRadius,
+    slingshotOffset: Math.min(height * 0.15, 100),
+    gridLeft,
+    gridRight,
+    leftWall: gridLeft + bubbleRadius,
+    rightWall: gridRight - bubbleRadius,
+  };
+}
+
+function drawSideWalls(
+  ctx: CanvasRenderingContext2D,
+  canvasHeight: number,
+  gridLeft: number,
+  gridRight: number,
+  isDesktopView: boolean,
+) {
+  if (isDesktopView) {
+    ctx.fillStyle = 'rgba(66, 165, 245, 0.85)';
+    ctx.fillRect(gridLeft, 0, 2, canvasHeight);
+    ctx.fillRect(gridRight - 2, 0, 2, canvasHeight);
+  } else {
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(gridLeft, 0);
+    ctx.lineTo(gridLeft, canvasHeight);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(gridRight, 0);
+    ctx.lineTo(gridRight, canvasHeight);
+    ctx.stroke();
+  }
+}
 /** Single Player-layout (GeminiSlingshot): scale från bredd 528, samma som Single Player-banan */
 const SINGLE_REF_WIDTH = 528;
 const SINGLE_REF_BUBBLE_RADIUS = 22;
@@ -1083,36 +1124,20 @@ const GameBoard = forwardRef<GameBoardHandle, GameBoardProps>(({ playerId, playe
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         ctx.fillStyle = '#0d0d0d';
         ctx.fillRect(0, 0, canvas.width, canvas.height);
-        const mirrorGridWidth = gridCols * bubbleRadius * 2;
-        const mirrorXOffset = (canvas.width - mirrorGridWidth) / 2 + bubbleRadius;
-        const mirrorGridLeft = mirrorXOffset - bubbleRadius;
-        const mirrorGridRight = mirrorXOffset + mirrorGridWidth - bubbleRadius;
-        const mirrorDesktop = canvas.width >= DESKTOP_WALL_REF_WIDTH;
-        if (mirrorDesktop) {
-          ctx.fillStyle = 'rgba(66, 165, 245, 0.85)';
-          ctx.fillRect(mirrorGridLeft, 0, 2, canvas.height);
-          ctx.fillRect(mirrorGridRight - 2, 0, 2, canvas.height);
-        } else {
-          ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
-          ctx.lineWidth = 4;
-          ctx.beginPath();
-          ctx.moveTo(2, 0);
-          ctx.lineTo(2, canvas.height);
-          ctx.stroke();
-          ctx.beginPath();
-          ctx.moveTo(canvas.width - 2, 0);
-          ctx.lineTo(canvas.width - 2, canvas.height);
-          ctx.stroke();
-        }
         if (remoteSnap && remoteSnap.width > 0 && remoteSnap.height > 0) {
           const sx = canvas.width / remoteSnap.width;
           const sy = canvas.height / remoteSnap.height;
+          const remoteLayout = computeMultiplayerLayout(remoteSnap.width, remoteSnap.height, gridCols);
+          const visLeft = remoteLayout.gridLeft * sx;
+          const visRight = remoteLayout.gridRight * sx;
+          const drawR = remoteLayout.bubbleRadius * sx;
+          drawSideWalls(ctx, canvas.height, visLeft, visRight, canvas.width >= DESKTOP_WALL_REF_WIDTH);
           remoteSnap.bubbles.forEach((b) => {
             if (!b.active) return;
-            drawBubble(ctx, b.x * sx, b.y * sy, bubbleRadius - 1, b.color, b.type);
+            drawBubble(ctx, b.x * sx, b.y * sy, drawR - 1, b.color, b.type);
           });
           const launcherX = canvas.width / 2;
-          const launcherY = canvas.height - layoutRef.current.slingshotOffset;
+          const launcherY = canvas.height - remoteLayout.slingshotOffset * sy;
           const slingScale = 0.82;
           const band = 40 * slingScale;
           const bandY = 10 * slingScale;
@@ -1133,15 +1158,17 @@ const GameBoard = forwardRef<GameBoardHandle, GameBoardProps>(({ playerId, playe
             ctx.lineTo(ballX, ballDrawY);
             ctx.stroke();
           }
-          const drawR = isFlyingRemote ? bubbleRadius : bubbleRadius * slingScale;
           drawBubble(
             ctx,
             ballX,
             ballDrawY,
-            drawR,
+            isFlyingRemote ? drawR : drawR * slingScale,
             ballColor,
             isFlyingRemote ? (remoteSnap.flyingBallIsFire ? 'fire' : undefined) : undefined
           );
+        } else {
+          const localLayout = computeMultiplayerLayout(canvas.width, canvas.height, gridCols);
+          drawSideWalls(ctx, canvas.height, localLayout.gridLeft, localLayout.gridRight, canvas.width >= DESKTOP_WALL_REF_WIDTH);
         }
         animationFrameId = requestAnimationFrame(render);
         return;
@@ -1188,9 +1215,7 @@ const GameBoard = forwardRef<GameBoardHandle, GameBoardProps>(({ playerId, playe
       const rightWall = gridRight - bubbleRadius;
 
       if (isDesktopView) {
-        ctx.fillStyle = 'rgba(66, 165, 245, 0.85)';
-        ctx.fillRect(gridLeft, 0, 2, canvas.height);
-        ctx.fillRect(gridRight - 2, 0, 2, canvas.height);
+        drawSideWalls(ctx, canvas.height, gridLeft, gridRight, true);
       }
       const dangerY = anchorPos.current.y - rowHeight;
       ctx.save();
@@ -1227,16 +1252,7 @@ const GameBoard = forwardRef<GameBoardHandle, GameBoardProps>(({ playerId, playe
       }
       ctx.restore();
       if (!isDesktopView) {
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
-        ctx.lineWidth = 4;
-        ctx.beginPath();
-        ctx.moveTo(2, 0);
-        ctx.lineTo(2, canvas.height);
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.moveTo(canvas.width - 2, 0);
-        ctx.lineTo(canvas.width - 2, canvas.height);
-        ctx.stroke();
+        drawSideWalls(ctx, canvas.height, gridLeft, gridRight, false);
       }
       if (!isRemoteMirror && remoteSnap && remoteSnap.width > 0 && remoteSnap.height > 0) {
         const sx = canvas.width / remoteSnap.width;
