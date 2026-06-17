@@ -8,6 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "lint": "tsc --noEmit",
+    "start": "node server.mjs",
     "server": "node server.mjs",
     "pages:deploy": "npm run build && wrangler pages deploy dist --project-name=gemini-slingshot"
   },
